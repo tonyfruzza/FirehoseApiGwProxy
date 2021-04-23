@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: The AWS CloudFormation template for Kinesis Stream
+Parameters:
+  Environment:
+    Description: 'dev, stage, or prod - this is for bucket tags'
+    Type: String
+    MinLength: '3'
+    MaxLength: '5'
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+  KinesisFirehoseDeliveryStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt
+          - DataBucket
+          - Arn
+        Prefix: cloudformation-test/kinesis-fh
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 100
+        CloudWatchLoggingOptions:
+          Enabled: 'false'
+        CompressionFormat: UNCOMPRESSED
+        EncryptionConfiguration:
+          NoEncryptionConfig: NoEncryption
+        RoleARN: !GetAtt
+          - FirehoseDeliveryIAMRole
+          - Arn
+    DependsOn:
+      - FirehoseDeliveryIAMPolicy
+  FirehoseDeliveryIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref AWS::AccountId
+  FirehoseDeliveryIAMPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: !Join
+        - ''
+        - - test-kinesis-fh-
+          - !Ref Environment
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource: !Join ['', [!GetAtt [DataBucket, Arn], '/cloudformation-test/kinesis-fh*']]
+      Roles:
+        - !Ref FirehoseDeliveryIAMRole
+  ApiGatewayRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: Firehose-Proxy
+      EndpointConfiguration:
+        Types:
+          - EDGE
+      Policy: ''
+  ApiGatewayResourceCreateuser:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt
+        - ApiGatewayRestApi
+        - RootResourceId
+      PathPart: 'firehose-path'
+      RestApiId: !Ref ApiGatewayRestApi
+  ApiGatewayMethodCreateuserPost:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: POST
+      RequestParameters: {}
+      ResourceId: !Ref ApiGatewayResourceCreateuser
+      RestApiId: !Ref ApiGatewayRestApi
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      Integration:
+        Credentials: !GetAtt [ GatewayRole, Arn ]
+        IntegrationHttpMethod: POST
+        RequestTemplates:
+          application/json: "{\"DeliveryStreamName\": \"$input.path('$.DeliveryStreamName')\", \"Record\": {\"Data\": \"$util.base64Encode($input.path('$.Record.Data'))\"}}"
+        RequestParameters: #Firehose requires the content type to not be json, but amz-json
+          integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+        Type: AWS
+        Uri:
+          Fn::Join:
+            - ""
+            - - "arn:aws:apigateway:"
+              - Ref: AWS::Region
+              - ":firehose:action/PutRecord"
+        IntegrationResponses:
+          - StatusCode: 200 #create a default response for the caller
+            ResponseTemplates:
+              application/json: '{"status":"OK"}'
+      MethodResponses:
+        - StatusCode: 200
+  ApiGatewayDeployment1619149074409:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: dev
+    DependsOn:
+      - ApiGatewayMethodCreateuserPost
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - apigateway.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: GatewayRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - firehose:PutRecord
+              Resource: !GetAtt [ KinesisFirehoseDeliveryStream, Arn]
+
+Outputs:
+  firehoseDeliveryStreamArn:
+    Description: Firehose Delivery Stream ARN
+    Value: !GetAtt
+      - KinesisFirehoseDeliveryStream
+      - Arn
+  firehoseDeliveryRoleArn:
+    Description: Firehose Delivery Role ARN
+    Value: !GetAtt
+      - FirehoseDeliveryIAMRole
+      - Arn
+Outputs:
+  BucketArn:
+    Value: !GetAtt
+      - DataBucket
+      - Arn
+  BucketPath:
+    Value: !Join ['', [!GetAtt [DataBucket, Arn], '/cloudformation-test/kinesis-fh*']]
+  Firehose:
+    Value: !Ref KinesisFirehoseDeliveryStream
+  ServiceEndpoint:
+    Description: URL of the service endpoint
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !Ref ApiGatewayRestApi
+        - .execute-api.
+        - !Ref 'AWS::Region'
+        - .
+        - !Ref 'AWS::URLSuffix'
+        - /dev/firehose-path/
